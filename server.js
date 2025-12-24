@@ -1,4 +1,4 @@
-// server.js — MCP over SSE (Render-ready) with sessionId support
+// server.js — MCP over SSE (Render-ready) for @modelcontextprotocol/sdk 1.25.x
 import http from "node:http";
 import { Server } from "@modelcontextprotocol/sdk/server";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-// -------------------- MCP server + tools --------------------
+/** ---------------- MCP: tools ---------------- */
 const mcp = new Server(
   { name: "mcp-hello", version: "0.0.1" },
   { capabilities: { tools: {} } }
@@ -29,16 +29,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
-
   if (name !== "echo") throw new Error(`Unknown tool: ${name}`);
-
   const text = typeof args?.text === "string" ? args.text : "";
   return { content: [{ type: "text", text: `echo: ${text}` }] };
 });
 
-// -------------------- Helpers --------------------
-function parseSessionId(urlString) {
-  // Works for "/sse?sessionId=..." or "/sse&sessionId=..." (just in case)
+/** ---------------- Helpers ---------------- */
+function getSessionId(urlString) {
   try {
     const u = new URL(urlString, "http://localhost");
     return u.searchParams.get("sessionId");
@@ -47,33 +44,48 @@ function parseSessionId(urlString) {
   }
 }
 
-// Store transports per sessionId to support parallel sessions safely
-const transports = new Map(); // sessionId -> SSEServerTransport
+// sessionId -> transport
+const transports = new Map();
+// transports opened by GET /sse before we know sessionId (we attach on first POST with sessionId)
+const pending = [];
 
-function cleanupTransport(sessionId) {
-  const t = transports.get(sessionId);
-  if (!t) return;
-  try {
-    t.close?.();
-  } catch {}
-  transports.delete(sessionId);
-}
-
-// -------------------- HTTP server --------------------
+/** ---------------- HTTP server ---------------- */
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
 
 const httpServer = http.createServer(async (req, res) => {
   const url = req.url || "/";
   const method = req.method || "GET";
 
-  // Health / root
+  // Health
   if (method === "GET" && (url === "/" || url.startsWith("/health"))) {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
     return;
   }
 
-  // Optional: debug available methods on transport (to verify in prod)
+  // OPTIONS / HEAD for validators/proxies
+  if (url.startsWith("/sse") && method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET,POST,OPTIONS,HEAD",
+      "Access-Control-Allow-Headers": "content-type, authorization",
+      "Access-Control-Max-Age": "86400",
+    });
+    res.end();
+    return;
+  }
+
+  if (url.startsWith("/sse") && method === "HEAD") {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    });
+    res.end();
+    return;
+  }
+
+  // Debug (optional)
   if (method === "GET" && url === "/debug-transport") {
     const proto = SSEServerTransport.prototype;
     const methods = Object.getOwnPropertyNames(proto).filter(
@@ -84,30 +96,27 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET /sse -> open SSE stream; transport will emit "endpoint" with sessionId
+  // GET /sse -> open SSE stream
   if (method === "GET" && url.startsWith("/sse")) {
     try {
       const transport = new SSEServerTransport("/sse", res);
 
-      // start() exists in твоей версии (ты видел в debug-transport)
+      // important for your SDK: start() exists and should be called
       await transport.start();
 
-      // Connect MCP server to this transport
       await mcp.connect(transport);
 
-      // Try to capture sessionId from request (usually absent on first GET),
-      // BUT transport will send endpoint event with sessionId to client.
-      // We'll store this transport under a temporary key until we see a sessionId on POST.
-      // To keep it simple: store by a generated key for now.
-      const tempKey = `__pending__${Date.now()}_${Math.random()}`;
-      transports.set(tempKey, transport);
+      pending.push(transport);
 
-      // If the connection closes, cleanup
+      // cleanup on disconnect
       res.on("close", () => {
-        // remove whichever key currently points to this transport
-        for (const [k, v] of transports.entries()) {
-          if (v === transport) {
-            cleanupTransport(k);
+        // remove from pending if still there
+        const i = pending.indexOf(transport);
+        if (i >= 0) pending.splice(i, 1);
+        // remove from session map if attached
+        for (const [sid, t] of transports.entries()) {
+          if (t === transport) {
+            transports.delete(sid);
             break;
           }
         }
@@ -124,34 +133,22 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // POST /sse?sessionId=... -> deliver messages into the right transport
+  // POST /sse?sessionId=... -> MUST use handlePostMessage(req,res)
   if (method === "POST" && url.startsWith("/sse")) {
-    const sessionId = parseSessionId(url);
+    const sid = getSessionId(url);
 
     try {
       let transport = null;
 
-      if (sessionId && transports.has(sessionId)) {
-        transport = transports.get(sessionId);
-      } else if (sessionId) {
-        // We don't have it mapped yet. Most likely first POST after GET.
-        // Attach the newest pending transport to this sessionId.
-        // Pick the most recently created pending transport.
-        const pendingKeys = [...transports.keys()].filter((k) =>
-          k.startsWith("__pending__")
-        );
-        const latestPendingKey = pendingKeys.sort().at(-1);
-
-        if (latestPendingKey) {
-          transport = transports.get(latestPendingKey);
-          transports.delete(latestPendingKey);
-          transports.set(sessionId, transport);
-        }
+      if (sid && transports.has(sid)) {
+        transport = transports.get(sid);
+      } else if (sid) {
+        // attach newest pending transport to this sessionId
+        transport = pending.pop() || null;
+        if (transport) transports.set(sid, transport);
       } else {
-        // No sessionId in POST. Fall back to any single transport (debug / legacy behavior).
-        // Prefer latest pending.
-        const anyKey = [...transports.keys()].sort().at(-1);
-        if (anyKey) transport = transports.get(anyKey);
+        // no sessionId: fallback to latest pending
+        transport = pending[pending.length - 1] || null;
       }
 
       if (!transport) {
@@ -160,7 +157,7 @@ const httpServer = http.createServer(async (req, res) => {
         return;
       }
 
-      // Your SDK has this exact method (from debug-transport):
+      // ✅ THIS is the correct handler for POST bodies in your build
       await transport.handlePostMessage(req, res);
       return;
     } catch (e) {
@@ -171,12 +168,11 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // Everything else
   res.writeHead(404, { "content-type": "text/plain" });
   res.end("Not found");
 });
 
-// Render requires listening on all interfaces
+// Render: bind all interfaces
 httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ MCP SSE server listening on port ${PORT}`);
 });
