@@ -65,6 +65,6 @@ const httpServer = http.createServer(async (req, res) => {
   res.end("Not found");
 });
 
-httpServer.listen(PORT, "127.0.0.1", () => {
-  console.log(`✅ MCP SSE server listening on http://127.0.0.1:${PORT}/sse`);
+httpServer.listen(PORT, () => {
+  console.log(`✅ MCP SSE server listening on port ${PORT}`);
 });
