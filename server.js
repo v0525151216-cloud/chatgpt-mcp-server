@@ -1,3 +1,4 @@
+// server.js — MCP over SSE (Render-ready) for @modelcontextprotocol/sdk 1.25.x
 import http from "node:http";
 import { Server } from "@modelcontextprotocol/sdk/server";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -6,93 +7,128 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-const server = new Server(
+// -------------------- MCP server + tools --------------------
+const mcp = new Server(
   { name: "mcp-hello", version: "0.0.1" },
   { capabilities: { tools: {} } }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "echo",
-      description: "Return the provided text",
-      inputSchema: {
-        type: "object",
-        properties: { text: { type: "string" } },
-        required: ["text"],
+mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+  return {
+    tools: [
+      {
+        name: "echo",
+        description: "Return the provided text",
+        inputSchema: {
+          type: "object",
+          properties: { text: { type: "string" } },
+          required: ["text"],
+        },
       },
-    },
-  ],
-}));
-
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  const { name, arguments: args } = req.params;
-  if (name !== "echo") throw new Error(`Unknown tool: ${name}`);
-  const text = typeof args?.text === "string" ? args.text : "";
-  return { content: [{ type: "text", text: `echo: ${text}` }] };
+    ],
+  };
 });
 
-let transport = null;
+mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const { name, arguments: args } = req.params;
+
+  if (name !== "echo") {
+    throw new Error(`Unknown tool: ${name}`);
+  }
+
+  const text = typeof args?.text === "string" ? args.text : "";
+  return {
+    content: [{ type: "text", text: `echo: ${text}` }],
+  };
+});
+
+// -------------------- HTTP + SSE wiring --------------------
+//
+// IMPORTANT: ChatGPT connector flow usually does:
+// 1) GET  /sse        -> opens SSE stream, server returns endpoint event with /sse?sessionId=...
+// 2) POST /sse?...    -> sends MCP messages to the server
+//
+// So we MUST handle both GET and POST for /sse.
+//
+// We'll keep the latest active transport (enough for base level).
+// If you later want multiple parallel sessions, we can store transports in a Map by sessionId.
+//
+let activeTransport = null;
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
 
 const httpServer = http.createServer(async (req, res) => {
   const url = req.url || "/";
 
-  // Быстрый health для проверок
+  // ---- quick health endpoints (Render, browser checks) ----
   if (req.method === "GET" && (url === "/" || url.startsWith("/health"))) {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
     return;
   }
 
-  // SSE: открыть поток
-  if (req.method === "GET" && url.startsWith("/sse")) {
-    transport = new SSEServerTransport("/sse", res);
-    await server.connect(transport);
-    return; // transport держит соединение открытым
+  // ---- debug: see what methods exist on SSEServerTransport (optional) ----
+  if (req.method === "GET" && url === "/debug-transport") {
+    const proto = SSEServerTransport.prototype;
+    const methods = Object.getOwnPropertyNames(proto).filter(
+      (n) => typeof proto[n] === "function"
+    );
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ methods }, null, 2));
+    return;
   }
 
-  // ВАЖНО: принимать сообщения от клиента (ChatGPT)
+  // ---- GET /sse : open SSE stream ----
+  if (req.method === "GET" && url.startsWith("/sse")) {
+    // Create a new transport bound to the /sse base path
+    activeTransport = new SSEServerTransport("/sse", res);
+
+    // Connect MCP server to this transport
+    await mcp.connect(activeTransport);
+
+    // DO NOT end the response; SSE transport keeps it open
+    return;
+  }
+
+  // ---- POST /sse : accept client->server MCP messages ----
+  // ChatGPT will POST either to /sse or /sse?sessionId=...
   if (req.method === "POST" && url.startsWith("/sse")) {
-    if (!transport) {
+    if (!activeTransport) {
       res.writeHead(409, { "content-type": "text/plain" });
-      res.end("SSE transport not initialized yet. Open GET /sse first.");
+      res.end("SSE not initialized. Open GET /sse first.");
       return;
     }
 
-    // В разных версиях SDK метод может называться чуть по-разному.
-    // Поэтому делаем “умный” вызов по доступному методу.
+    // Different SDK builds used different method names.
+    // We call the first matching handler that exists.
     const candidates = [
-      "handlePost",
       "handlePostRequest",
+      "handlePost",
       "handleRequest",
       "handleMessage",
     ];
 
     for (const m of candidates) {
-      if (typeof transport[m] === "function") {
-        await transport[m](req, res);
+      if (typeof activeTransport[m] === "function") {
+        await activeTransport[m](req, res);
         return;
       }
     }
 
+    // If we get here, SDK changed and we need to adjust handler name.
     res.writeHead(500, { "content-type": "text/plain" });
-    res.end("SSE transport: no POST handler method found on this SDK version.");
+    res.end(
+      "No POST handler found on SSEServerTransport. Open /debug-transport and check available methods."
+    );
     return;
   }
-if (req.method === "GET" && req.url === "/debug-transport") {
-  // покажем методы SSEServerTransport, чтобы понять как принимать POST
-  const proto = SSEServerTransport.prototype;
-  const methods = Object.getOwnPropertyNames(proto).filter(n => typeof proto[n] === "function");
-  res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ methods }, null, 2));
-  return;
-}
-  res.writeHead(404);
+
+  // ---- everything else ----
+  res.writeHead(404, { "content-type": "text/plain" });
   res.end("Not found");
 });
 
-httpServer.listen(PORT, () => {
+// IMPORTANT for Render: listen on 0.0.0.0 (not 127.0.0.1)
+httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ MCP SSE server listening on port ${PORT}`);
 });
