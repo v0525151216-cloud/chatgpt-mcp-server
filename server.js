@@ -6,9 +6,10 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-// MCP server
+/* ---------------- MCP server ---------------- */
+
 const mcp = new Server(
-  { name: "mcp-hello", version: "0.0.1" },
+  { name: "chatgpt-mcp-server", version: "0.1.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -16,10 +17,27 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "echo",
-      description: "Return the provided text",
+      description: "Return the provided text (sanity check tool).",
       inputSchema: {
         type: "object",
         properties: { text: { type: "string" } },
+        required: ["text"],
+      },
+    },
+    {
+      name: "respond",
+      description:
+        "Return a custom response controlled by JSON input (text/markdown/multi).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          mode: { type: "string", enum: ["text", "markdown", "multi"] },
+          title: { type: "string" },
+          text: { type: "string" },
+          bullets: { type: "array", items: { type: "string" } },
+          json: { type: "object" },
+          repeat: { type: "integer", minimum: 1, maximum: 5 },
+        },
         required: ["text"],
       },
     },
@@ -28,10 +46,53 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
-  if (name !== "echo") throw new Error(`Unknown tool: ${name}`);
-  const text = typeof args?.text === "string" ? args.text : "";
-  return { content: [{ type: "text", text: `echo: ${text}` }] };
+
+  // Log every tool call (to prove requests hit your server)
+  console.log("TOOL CALL:", name, JSON.stringify(args ?? {}));
+
+  if (name === "echo") {
+    const text = typeof args?.text === "string" ? args.text : "";
+    return { content: [{ type: "text", text: `echo: ${text}` }] };
+  }
+
+  if (name === "respond") {
+    const mode = typeof args?.mode === "string" ? args.mode : "text";
+    const title = typeof args?.title === "string" ? args.title : "";
+    const text = typeof args?.text === "string" ? args.text : "";
+    const bullets = Array.isArray(args?.bullets)
+      ? args.bullets.filter((x) => typeof x === "string")
+      : [];
+    const repeatRaw = Number.isInteger(args?.repeat) ? args.repeat : 1;
+    const repeat = Math.max(1, Math.min(5, repeatRaw));
+
+    let out = text;
+
+    if (title) out = `${title}\n\n${out}`;
+    if (bullets.length) out += `\n\n- ${bullets.join("\n- ")}`;
+
+    if (args?.json && typeof args.json === "object") {
+      out += `\n\n\`\`\`json\n${JSON.stringify(args.json, null, 2)}\n\`\`\``;
+    }
+
+    if (mode === "multi") {
+      const content = [];
+      for (let i = 0; i < repeat; i++) content.push({ type: "text", text: out });
+      return { content };
+    }
+
+    // "markdown" is returned as text; ChatGPT will render markdown
+    return { content: [{ type: "text", text: out }] };
+  }
+
+  throw new Error(`Unknown tool: ${name}`);
 });
+
+/* ---------------- SSE plumbing ---------------- */
+
+// sessionId -> transport
+const transports = new Map();
+// transports opened by GET /sse before we know sessionId (attach on first POST with sessionId)
+const pending = [];
 
 function getSessionId(urlString) {
   try {
@@ -42,23 +103,20 @@ function getSessionId(urlString) {
   }
 }
 
-const transports = new Map(); // sessionId -> transport
-const pending = []; // transports opened by GET before we know sessionId
-
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
 
 const httpServer = http.createServer(async (req, res) => {
   const url = req.url || "/";
   const method = req.method || "GET";
 
-  // health
+  // Health
   if (method === "GET" && (url === "/" || url.startsWith("/health"))) {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
     return;
   }
 
-  // OPTIONS / HEAD (some validators do this)
+  // Some validators/proxies do OPTIONS preflight
   if (url.startsWith("/sse") && method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
@@ -70,6 +128,7 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
+  // Some validators do HEAD checks
   if (url.startsWith("/sse") && method === "HEAD") {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -80,7 +139,7 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // debug
+  // Debug helper (optional)
   if (method === "GET" && url === "/debug-transport") {
     const proto = SSEServerTransport.prototype;
     const methods = Object.getOwnPropertyNames(proto).filter(
@@ -96,15 +155,16 @@ const httpServer = http.createServer(async (req, res) => {
     try {
       const transport = new SSEServerTransport("/sse", res);
 
-      // IMPORTANT: DO NOT call transport.start() manually.
-      // Server.connect() will call start() itself in your SDK.
+      // IMPORTANT: In your SDK, Server.connect() calls transport.start() automatically.
       await mcp.connect(transport);
 
       pending.push(transport);
 
+      // cleanup on disconnect
       res.on("close", () => {
         const i = pending.indexOf(transport);
         if (i >= 0) pending.splice(i, 1);
+
         for (const [sid, t] of transports.entries()) {
           if (t === transport) {
             transports.delete(sid);
@@ -113,7 +173,7 @@ const httpServer = http.createServer(async (req, res) => {
         }
       });
 
-      return;
+      return; // keep connection open
     } catch (e) {
       console.error("GET /sse error:", e);
       try {
@@ -124,7 +184,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // POST /sse?sessionId=... -> handle MCP messages
+  // POST /sse?sessionId=... -> deliver client->server messages into transport
   if (method === "POST" && url.startsWith("/sse")) {
     const sid = getSessionId(url);
 
@@ -134,9 +194,11 @@ const httpServer = http.createServer(async (req, res) => {
       if (sid && transports.has(sid)) {
         transport = transports.get(sid);
       } else if (sid) {
+        // attach newest pending transport to this sessionId
         transport = pending.pop() || null;
         if (transport) transports.set(sid, transport);
       } else {
+        // no sessionId: fallback to latest pending
         transport = pending[pending.length - 1] || null;
       }
 
@@ -146,7 +208,7 @@ const httpServer = http.createServer(async (req, res) => {
         return;
       }
 
-      // Your SDK supports this method:
+      // ✅ Correct method for your SDK (you confirmed it exists)
       await transport.handlePostMessage(req, res);
       return;
     } catch (e) {
@@ -161,6 +223,7 @@ const httpServer = http.createServer(async (req, res) => {
   res.end("Not found");
 });
 
+// Render: bind on all interfaces
 httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ MCP SSE server listening on port ${PORT}`);
 });
