@@ -61,6 +61,11 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   // простая заглушка
+  if (req.method === "GET" && (req.url === "/" || req.url.startsWith("/health"))) {
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.end("ok");
+  return;
+}
   res.writeHead(404);
   res.end("Not found");
 });
