@@ -1,4 +1,4 @@
-// server.js — MCP over SSE (Render-ready) for @modelcontextprotocol/sdk 1.25.x
+// server.js — MCP over SSE (Render-ready) with sessionId support
 import http from "node:http";
 import { Server } from "@modelcontextprotocol/sdk/server";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -13,62 +13,68 @@ const mcp = new Server(
   { capabilities: { tools: {} } }
 );
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "echo",
-        description: "Return the provided text",
-        inputSchema: {
-          type: "object",
-          properties: { text: { type: "string" } },
-          required: ["text"],
-        },
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "echo",
+      description: "Return the provided text",
+      inputSchema: {
+        type: "object",
+        properties: { text: { type: "string" } },
+        required: ["text"],
       },
-    ],
-  };
-});
+    },
+  ],
+}));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
 
-  if (name !== "echo") {
-    throw new Error(`Unknown tool: ${name}`);
-  }
+  if (name !== "echo") throw new Error(`Unknown tool: ${name}`);
 
   const text = typeof args?.text === "string" ? args.text : "";
-  return {
-    content: [{ type: "text", text: `echo: ${text}` }],
-  };
+  return { content: [{ type: "text", text: `echo: ${text}` }] };
 });
 
-// -------------------- HTTP + SSE wiring --------------------
-//
-// IMPORTANT: ChatGPT connector flow usually does:
-// 1) GET  /sse        -> opens SSE stream, server returns endpoint event with /sse?sessionId=...
-// 2) POST /sse?...    -> sends MCP messages to the server
-//
-// So we MUST handle both GET and POST for /sse.
-//
-// We'll keep the latest active transport (enough for base level).
-// If you later want multiple parallel sessions, we can store transports in a Map by sessionId.
-//
-let activeTransport = null;
+// -------------------- Helpers --------------------
+function parseSessionId(urlString) {
+  // Works for "/sse?sessionId=..." or "/sse&sessionId=..." (just in case)
+  try {
+    const u = new URL(urlString, "http://localhost");
+    return u.searchParams.get("sessionId");
+  } catch {
+    return null;
+  }
+}
 
+// Store transports per sessionId to support parallel sessions safely
+const transports = new Map(); // sessionId -> SSEServerTransport
+
+function cleanupTransport(sessionId) {
+  const t = transports.get(sessionId);
+  if (!t) return;
+  try {
+    t.close?.();
+  } catch {}
+  transports.delete(sessionId);
+}
+
+// -------------------- HTTP server --------------------
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
 
 const httpServer = http.createServer(async (req, res) => {
   const url = req.url || "/";
+  const method = req.method || "GET";
 
-  // ---- quick health endpoints (Render, browser checks) ----
-  if (req.method === "GET" && (url === "/" || url.startsWith("/health"))) {
+  // Health / root
+  if (method === "GET" && (url === "/" || url.startsWith("/health"))) {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
     return;
   }
 
-  // ---- debug: see what methods exist on SSEServerTransport (optional) ----
-  if (req.method === "GET" && url === "/debug-transport") {
+  // Optional: debug available methods on transport (to verify in prod)
+  if (method === "GET" && url === "/debug-transport") {
     const proto = SSEServerTransport.prototype;
     const methods = Object.getOwnPropertyNames(proto).filter(
       (n) => typeof proto[n] === "function"
@@ -78,84 +84,99 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // ---- GET /sse : open SSE stream ----
-  if (req.method === "GET" && url.startsWith("/sse")) {
-    // Create a new transport bound to the /sse base path
-    activeTransport = new SSEServerTransport("/sse", res);
+  // GET /sse -> open SSE stream; transport will emit "endpoint" with sessionId
+  if (method === "GET" && url.startsWith("/sse")) {
+    try {
+      const transport = new SSEServerTransport("/sse", res);
 
-    // Connect MCP server to this transport
-    await mcp.connect(activeTransport);
+      // start() exists in твоей версии (ты видел в debug-transport)
+      await transport.start();
 
-    // DO NOT end the response; SSE transport keeps it open
-    return;
-  }
+      // Connect MCP server to this transport
+      await mcp.connect(transport);
 
-  // ---- POST /sse : accept client->server MCP messages ----
-  // ChatGPT will POST either to /sse or /sse?sessionId=...
-// ---- GET /sse : open SSE stream ----
-if (req.method === "POST" && url.startsWith("/sse")) {
-  if (!activeTransport) {
-    res.writeHead(409, { "content-type": "text/plain" });
-    res.end("SSE not initialized. Open GET /sse first.");
-    return;
-  }
+      // Try to capture sessionId from request (usually absent on first GET),
+      // BUT transport will send endpoint event with sessionId to client.
+      // We'll store this transport under a temporary key until we see a sessionId on POST.
+      // To keep it simple: store by a generated key for now.
+      const tempKey = `__pending__${Date.now()}_${Math.random()}`;
+      transports.set(tempKey, transport);
 
-  await activeTransport.handlePostMessage(req, res);
-  return;
-}
+      // If the connection closes, cleanup
+      res.on("close", () => {
+        // remove whichever key currently points to this transport
+        for (const [k, v] of transports.entries()) {
+          if (v === transport) {
+            cleanupTransport(k);
+            break;
+          }
+        }
+      });
 
-
-// ---- POST /sse : accept client->server MCP messages ----
-if (req.method === "POST" && url.startsWith("/sse")) {
-  try {
-    if (!activeTransport) {
-      res.writeHead(409, { "content-type": "text/plain" });
-      res.end("SSE not initialized. Open GET /sse first.");
+      return; // keep SSE open
+    } catch (e) {
+      console.error("GET /sse error:", e);
+      try {
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end("SSE init error");
+      } catch {}
       return;
     }
-
-    // ТВОЙ реальный метод (из debug-transport)
-    await activeTransport.handlePostMessage(req, res);
-    return;
-  } catch (e) {
-    console.error("POST /sse error:", e);
-    res.writeHead(500, { "content-type": "text/plain" });
-    res.end("POST handler error");
-    return;
   }
-}
 
+  // POST /sse?sessionId=... -> deliver messages into the right transport
+  if (method === "POST" && url.startsWith("/sse")) {
+    const sessionId = parseSessionId(url);
 
-    // Different SDK builds used different method names.
-    // We call the first matching handler that exists.
-    const candidates = [
-      "handlePostRequest",
-      "handlePost",
-      "handleRequest",
-      "handleMessage",
-    ];
+    try {
+      let transport = null;
 
-    for (const m of candidates) {
-      if (typeof activeTransport[m] === "function") {
-        await activeTransport[m](req, res);
+      if (sessionId && transports.has(sessionId)) {
+        transport = transports.get(sessionId);
+      } else if (sessionId) {
+        // We don't have it mapped yet. Most likely first POST after GET.
+        // Attach the newest pending transport to this sessionId.
+        // Pick the most recently created pending transport.
+        const pendingKeys = [...transports.keys()].filter((k) =>
+          k.startsWith("__pending__")
+        );
+        const latestPendingKey = pendingKeys.sort().at(-1);
+
+        if (latestPendingKey) {
+          transport = transports.get(latestPendingKey);
+          transports.delete(latestPendingKey);
+          transports.set(sessionId, transport);
+        }
+      } else {
+        // No sessionId in POST. Fall back to any single transport (debug / legacy behavior).
+        // Prefer latest pending.
+        const anyKey = [...transports.keys()].sort().at(-1);
+        if (anyKey) transport = transports.get(anyKey);
+      }
+
+      if (!transport) {
+        res.writeHead(409, { "content-type": "text/plain" });
+        res.end("No active SSE transport. Open GET /sse first.");
         return;
       }
-    }
 
-    // If we get here, SDK changed and we need to adjust handler name.
-    res.writeHead(500, { "content-type": "text/plain" });
-    res.end(
-      "No POST handler found on SSEServerTransport. Open /debug-transport and check available methods."
-    );
-    return;
+      // Your SDK has this exact method (from debug-transport):
+      await transport.handlePostMessage(req, res);
+      return;
+    } catch (e) {
+      console.error("POST /sse error:", e);
+      res.writeHead(500, { "content-type": "text/plain" });
+      res.end("POST handler error");
+      return;
+    }
   }
 
-  // ---- everything else ----
+  // Everything else
   res.writeHead(404, { "content-type": "text/plain" });
   res.end("Not found");
 });
 
-// IMPORTANT for Render: listen on 0.0.0.0 (not 127.0.0.1)
+// Render requires listening on all interfaces
 httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ MCP SSE server listening on port ${PORT}`);
 });
