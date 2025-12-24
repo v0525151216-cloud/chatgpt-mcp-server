@@ -1,4 +1,3 @@
-// server.js — MCP over SSE (Render-ready) for @modelcontextprotocol/sdk 1.25.x
 import http from "node:http";
 import { Server } from "@modelcontextprotocol/sdk/server";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -7,7 +6,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-/** ---------------- MCP: tools ---------------- */
+// MCP server
 const mcp = new Server(
   { name: "mcp-hello", version: "0.0.1" },
   { capabilities: { tools: {} } }
@@ -34,7 +33,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   return { content: [{ type: "text", text: `echo: ${text}` }] };
 });
 
-/** ---------------- Helpers ---------------- */
 function getSessionId(urlString) {
   try {
     const u = new URL(urlString, "http://localhost");
@@ -44,26 +42,23 @@ function getSessionId(urlString) {
   }
 }
 
-// sessionId -> transport
-const transports = new Map();
-// transports opened by GET /sse before we know sessionId (we attach on first POST with sessionId)
-const pending = [];
+const transports = new Map(); // sessionId -> transport
+const pending = []; // transports opened by GET before we know sessionId
 
-/** ---------------- HTTP server ---------------- */
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8787;
 
 const httpServer = http.createServer(async (req, res) => {
   const url = req.url || "/";
   const method = req.method || "GET";
 
-  // Health
+  // health
   if (method === "GET" && (url === "/" || url.startsWith("/health"))) {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("ok");
     return;
   }
 
-  // OPTIONS / HEAD for validators/proxies
+  // OPTIONS / HEAD (some validators do this)
   if (url.startsWith("/sse") && method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
@@ -85,7 +80,7 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // Debug (optional)
+  // debug
   if (method === "GET" && url === "/debug-transport") {
     const proto = SSEServerTransport.prototype;
     const methods = Object.getOwnPropertyNames(proto).filter(
@@ -101,19 +96,15 @@ const httpServer = http.createServer(async (req, res) => {
     try {
       const transport = new SSEServerTransport("/sse", res);
 
-      // important for your SDK: start() exists and should be called
-      await transport.start();
-
+      // IMPORTANT: DO NOT call transport.start() manually.
+      // Server.connect() will call start() itself in your SDK.
       await mcp.connect(transport);
 
       pending.push(transport);
 
-      // cleanup on disconnect
       res.on("close", () => {
-        // remove from pending if still there
         const i = pending.indexOf(transport);
         if (i >= 0) pending.splice(i, 1);
-        // remove from session map if attached
         for (const [sid, t] of transports.entries()) {
           if (t === transport) {
             transports.delete(sid);
@@ -122,7 +113,7 @@ const httpServer = http.createServer(async (req, res) => {
         }
       });
 
-      return; // keep SSE open
+      return;
     } catch (e) {
       console.error("GET /sse error:", e);
       try {
@@ -133,7 +124,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
   }
 
-  // POST /sse?sessionId=... -> MUST use handlePostMessage(req,res)
+  // POST /sse?sessionId=... -> handle MCP messages
   if (method === "POST" && url.startsWith("/sse")) {
     const sid = getSessionId(url);
 
@@ -143,11 +134,9 @@ const httpServer = http.createServer(async (req, res) => {
       if (sid && transports.has(sid)) {
         transport = transports.get(sid);
       } else if (sid) {
-        // attach newest pending transport to this sessionId
         transport = pending.pop() || null;
         if (transport) transports.set(sid, transport);
       } else {
-        // no sessionId: fallback to latest pending
         transport = pending[pending.length - 1] || null;
       }
 
@@ -157,7 +146,7 @@ const httpServer = http.createServer(async (req, res) => {
         return;
       }
 
-      // ✅ THIS is the correct handler for POST bodies in your build
+      // Your SDK supports this method:
       await transport.handlePostMessage(req, res);
       return;
     } catch (e) {
@@ -172,7 +161,6 @@ const httpServer = http.createServer(async (req, res) => {
   res.end("Not found");
 });
 
-// Render: bind all interfaces
 httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ MCP SSE server listening on port ${PORT}`);
 });
