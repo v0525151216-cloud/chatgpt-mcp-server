@@ -92,12 +92,47 @@ const httpServer = http.createServer(async (req, res) => {
 
   // ---- POST /sse : accept client->server MCP messages ----
   // ChatGPT will POST either to /sse or /sse?sessionId=...
-  if (req.method === "POST" && url.startsWith("/sse")) {
+// ---- GET /sse : open SSE stream ----
+if (req.method === "GET" && url.startsWith("/sse")) {
+  try {
+    activeTransport = new SSEServerTransport("/sse", res);
+
+    // ВАЖНО: стартуем транспорт (в твоей версии метод есть)
+    await activeTransport.start();
+
+    // Коннектим MCP сервер к транспорту
+    await mcp.connect(activeTransport);
+    return;
+  } catch (e) {
+    console.error("GET /sse error:", e);
+    try {
+      res.writeHead(500, { "content-type": "text/plain" });
+      res.end("SSE init error");
+    } catch {}
+    return;
+  }
+}
+
+// ---- POST /sse : accept client->server MCP messages ----
+if (req.method === "POST" && url.startsWith("/sse")) {
+  try {
     if (!activeTransport) {
       res.writeHead(409, { "content-type": "text/plain" });
       res.end("SSE not initialized. Open GET /sse first.");
       return;
     }
+
+    // ТВОЙ реальный метод (из debug-transport)
+    await activeTransport.handlePostMessage(req, res);
+    return;
+  } catch (e) {
+    console.error("POST /sse error:", e);
+    res.writeHead(500, { "content-type": "text/plain" });
+    res.end("POST handler error");
+    return;
+  }
+}
+
 
     // Different SDK builds used different method names.
     // We call the first matching handler that exists.
