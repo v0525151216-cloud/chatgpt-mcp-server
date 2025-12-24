@@ -81,7 +81,14 @@ const httpServer = http.createServer(async (req, res) => {
     res.end("SSE transport: no POST handler method found on this SDK version.");
     return;
   }
-
+if (req.method === "GET" && req.url === "/debug-transport") {
+  // покажем методы SSEServerTransport, чтобы понять как принимать POST
+  const proto = SSEServerTransport.prototype;
+  const methods = Object.getOwnPropertyNames(proto).filter(n => typeof proto[n] === "function");
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ methods }, null, 2));
+  return;
+}
   res.writeHead(404);
   res.end("Not found");
 });
